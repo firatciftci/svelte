@@ -36,7 +36,8 @@ import {
 	next,
 	read_hydration_instruction,
 	skip_nodes,
-	set_hydrate_node
+	set_hydrate_node,
+	set_hydrating
 } from '../hydration.js';
 import { queue_micro_task } from '../task.js';
 import * as e from '../../errors.js';
@@ -49,7 +50,7 @@ import { createSubscriber } from '../../../../reactivity/create-subscriber.js';
 import { create_anchor, create_fragment, append_child, insert_before } from '../operations.js';
 import { set_signal_status } from '../../reactivity/status.js';
 import { push_renderer, pop_renderer } from '../../custom-renderer/state.js';
-import { custom_renderers_flag } from '../../../flags/index.js';
+import { async_mode_flag, custom_renderers_flag } from '../../../flags/index.js';
 
 /**
  * @typedef {{
@@ -62,6 +63,16 @@ import { custom_renderers_flag } from '../../../flags/index.js';
 var flags = EFFECT_TRANSPARENT | EFFECT_PRESERVED;
 
 /**
+ * Whether a `<svelte:boundary>` was ever created (i.e. `boundary` was called). Until then every boundary is a
+ * root boundary created by `mount`/`hydrate` (which construct `Boundary` directly), which has neither `failed` nor
+ * `onerror`, so `Boundary#error` always rethrows and the error handling of `<svelte:boundary>` can be skipped.
+ * Since this is only assigned in `boundary`, bundlers treat it as `false` when that isn't bundled, and remove
+ * the error handling it guards from apps without `<svelte:boundary>`. It must be the first operand of those
+ * guards so that they can be folded away
+ */
+let boundaries_used = false;
+
+/**
  * @param {TemplateNode} node
  * @param {BoundaryProps} props
  * @param {((anchor: Node) => void)} children
@@ -69,6 +80,7 @@ var flags = EFFECT_TRANSPARENT | EFFECT_PRESERVED;
  * @returns {void}
  */
 export function boundary(node, props, children, transform_error) {
+	boundaries_used = true;
 	new Boundary(node, props, children, transform_error);
 }
 
@@ -112,7 +124,11 @@ export class Boundary {
 	/** @type {DocumentFragment | null} */
 	#offscreen_fragment = null;
 
-	#local_pending_count = 0;
+	/**
+	 * The number of pending async deriveds/expressions. Public so that `pending()` can
+	 * create the `effect_pending` source with the current count
+	 */
+	local_pending_count = 0;
 	#pending_count_update_queued = false;
 
 	/**
@@ -132,22 +148,17 @@ export class Boundary {
 	 * A source containing the number of pending async deriveds/expressions.
 	 * Only created if `$effect.pending()` is used inside the boundary,
 	 * otherwise updating the source results in needless `Batch.ensure()`
-	 * calls followed by no-op flushes
+	 * calls followed by no-op flushes. Created and cleared by `pending()` (outside the class, so
+	 * that `createSubscriber` is tree-shaken when `$effect.pending()` is unused)
 	 * @type {Source<number> | null}
 	 */
-	#effect_pending = null;
+	effect_pending = null;
 
-	#effect_pending_subscriber = createSubscriber(() => {
-		this.#effect_pending = source(this.#local_pending_count);
-
-		if (DEV) {
-			tag(this.#effect_pending, '$effect.pending()');
-		}
-
-		return () => {
-			this.#effect_pending = null;
-		};
-	});
+	/**
+	 * Subscribes the current reaction to `effect_pending`. Created by `pending()` on first use
+	 * @type {(() => void) | null}
+	 */
+	effect_pending_subscriber = null;
 
 	/**
 	 * @param {TemplateNode} node
@@ -204,9 +215,13 @@ export class Boundary {
 	}
 
 	#hydrate_resolved_content() {
+		var was_hydrating = hydrating;
+
 		try {
 			this.#main_effect = branch(() => this.#children(this.#anchor));
 		} catch (error) {
+			// a block with a hydration mismatch may have turned hydration off before throwing
+			if (was_hydrating) set_hydrating(true);
 			this.error(error);
 		}
 	}
@@ -336,13 +351,13 @@ export class Boundary {
 	#render() {
 		try {
 			this.is_pending = this.has_pending_snippet();
-			this.#local_pending_count = 0;
+			this.local_pending_count = 0;
 
 			this.#main_effect = branch(() => {
 				this.#children(this.#anchor);
 			});
 
-			if (this.#pending.size === 0) {
+			if (!async_mode_flag || this.#pending.size === 0) {
 				this.is_pending = false;
 			} else {
 				const pending = this.#props.pending;
@@ -401,6 +416,8 @@ export class Boundary {
 	 * @param {Batch} batch
 	 */
 	is_ready(batch) {
+		if (!async_mode_flag) return true;
+
 		if (batch.is_fork && this.#pending.size > 0) {
 			return false;
 		}
@@ -455,6 +472,8 @@ export class Boundary {
 	 * @param {Batch} batch
 	 */
 	increment(effect, batch) {
+		if (!async_mode_flag) return;
+
 		var pending = this.#pending.get(batch);
 
 		if (pending === undefined) {
@@ -470,6 +489,8 @@ export class Boundary {
 	 * @param {Batch} batch
 	 */
 	decrement(effect, batch) {
+		if (!async_mode_flag) return;
+
 		var pending = /** @type {Map<Effect, number>} */ (this.#pending.get(batch));
 		var count = /** @type {number} */ (pending.get(effect));
 
@@ -499,22 +520,19 @@ export class Boundary {
 	 * @param {1 | -1} d
 	 */
 	update_effect_pending(d) {
-		this.#local_pending_count += d;
+		if (!async_mode_flag) return;
 
-		if (!this.#effect_pending || this.#pending_count_update_queued) return;
+		this.local_pending_count += d;
+
+		if (!this.effect_pending || this.#pending_count_update_queued) return;
 		this.#pending_count_update_queued = true;
 
 		queue_micro_task(() => {
 			this.#pending_count_update_queued = false;
-			if (this.#effect_pending) {
-				internal_set(this.#effect_pending, this.#local_pending_count);
+			if (this.effect_pending) {
+				internal_set(this.effect_pending, this.local_pending_count);
 			}
 		});
-	}
-
-	get_effect_pending() {
-		this.#effect_pending_subscriber();
-		return get(/** @type {Source<number>} */ (this.#effect_pending));
 	}
 
 	/** @param {unknown} error */
@@ -524,12 +542,13 @@ export class Boundary {
 		}
 
 		// If we have nothing to capture the error, or if we hit an error while
-		// rendering the fallback, re-throw for another boundary to handle
-		if (!this.#props.onerror && !this.#props.failed) {
+		// rendering the fallback, re-throw for another boundary to handle.
+		// (Without `boundaries_used`, this is a root boundary, which has neither — see its docs)
+		if (!boundaries_used || (!this.#props.onerror && !this.#props.failed)) {
 			throw error;
 		}
 
-		if (current_batch?.is_fork) {
+		if (async_mode_flag && current_batch?.is_fork) {
 			if (this.#main_effect) current_batch.skip_effect(this.#main_effect);
 			if (this.#pending_effect) current_batch.skip_effect(this.#pending_effect);
 			if (this.#failed_effect) current_batch.skip_effect(this.#failed_effect);
@@ -546,6 +565,10 @@ export class Boundary {
 	 * @param {unknown} error
 	 */
 	#handle_error(error) {
+		// Only reachable from `error()` after the check above, so unreachable without `boundaries_used`.
+		// This guard exists so that bundlers can drop the body (rollup can't remove unused class members)
+		if (!boundaries_used) return;
+
 		if (this.#main_effect) {
 			destroy_effect(this.#main_effect);
 			this.#main_effect = null;
@@ -639,11 +662,27 @@ export function pending() {
 		e.effect_pending_outside_reaction();
 	}
 
-	var boundary = active_effect.b;
+	// `const` so that the `null` check below narrows `boundary` inside the closures too
+	const boundary = active_effect.b;
 
 	if (boundary === null) {
 		return 0; // TODO eventually we will need this to be global
 	}
 
-	return boundary.get_effect_pending();
+	// The subscriber is created here rather than in the `Boundary` class (rollup can't tree-shake
+	// class members), so that `createSubscriber` is only bundled if `$effect.pending()` is used
+	boundary.effect_pending_subscriber ??= createSubscriber(() => {
+		boundary.effect_pending = source(boundary.local_pending_count);
+
+		if (DEV) {
+			tag(boundary.effect_pending, '$effect.pending()');
+		}
+
+		return () => {
+			boundary.effect_pending = null;
+		};
+	});
+
+	boundary.effect_pending_subscriber();
+	return get(/** @type {Source<number>} */ (boundary.effect_pending));
 }

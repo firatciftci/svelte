@@ -139,13 +139,13 @@ export function mutate(source, value) {
 }
 
 /**
- * @template V
- * @param {Value<V>} source
- * @param {V} value
- * @param {boolean} [should_proxy]
- * @returns {V}
+ * Throws if `source` cannot be written to in the current reaction. Called by `set`, and by
+ * objects like `SvelteMap` that must check before changing data of their own — those then
+ * write the rest of their sources with `unchecked_set`, so that they either change
+ * entirely or not at all
+ * @param {Value} source
  */
-export function set(source, value, should_proxy = false) {
+export function check_mutation(source) {
 	if (
 		active_reaction !== null &&
 		// since we are untracking the function inside `$inspect.with` we need to add this check
@@ -157,7 +157,32 @@ export function set(source, value, should_proxy = false) {
 	) {
 		e.state_unsafe_mutation();
 	}
+}
 
+/**
+ * @template V
+ * @param {Value<V>} source
+ * @param {V} value
+ * @param {boolean} [should_proxy]
+ * @returns {V}
+ */
+export function set(source, value, should_proxy = false) {
+	check_mutation(source);
+	return unchecked_set(source, value, should_proxy);
+}
+
+/**
+ * Like `set`, but without `check_mutation`. Only use this after checking a source that
+ * belongs to the same object (such as its version)
+ * TOOD 6.0 many calls to `unchecked_set` could be `internal_set`, once we
+ * get rid of `legacy_updates`
+ * @template V
+ * @param {Value<V>} source
+ * @param {V} value
+ * @param {boolean} [should_proxy]
+ * @returns {V}
+ */
+export function unchecked_set(source, value, should_proxy = false) {
 	let new_value = should_proxy ? proxy(value) : value;
 
 	if (DEV) {
@@ -165,6 +190,21 @@ export function set(source, value, should_proxy = false) {
 	}
 
 	return internal_set(source, new_value, legacy_updates);
+}
+
+/**
+ * Equivalent to `set(source, value)` for a number/bigint (used by `update`, `update_pre` and `increment`).
+ * It exists so those functions don't reference `set` → `unchecked_set` → `proxy`, which would
+ * otherwise keep all of `proxy.js` in bundles that only increment/decrement state.
+ * Skipping `tag_proxy` is fine: it is a no-op for primitives
+ * @template {number | bigint} V
+ * @param {Value<V>} source
+ * @param {V} value
+ * @returns {V}
+ */
+function set_number(source, value) {
+	check_mutation(source);
+	return internal_set(source, value, legacy_updates);
 }
 
 /**
@@ -290,7 +330,7 @@ export function update(source, d = 1) {
 	var value = get(source);
 	var result = d === 1 ? value++ : value--;
 
-	set(source, value);
+	set_number(source, value);
 
 	// @ts-expect-error
 	return result;
@@ -307,7 +347,7 @@ export function update_pre(source, d = 1) {
 
 	// @ts-expect-error
 	// eslint-disable-next-line no-useless-assignment -- `++`/`--` used for return value, not side effect on `value`
-	return set(source, d === 1 ? ++value : --value);
+	return set_number(source, d === 1 ? ++value : --value);
 }
 
 /**
@@ -315,5 +355,13 @@ export function update_pre(source, d = 1) {
  * @param {Source<number>} source
  */
 export function increment(source) {
-	set(source, source.v + 1);
+	set_number(source, source.v + 1);
+}
+
+/**
+ * Like `increment`, but without `check_mutation` — see `unchecked_set`
+ * @param {Source<number>} source
+ */
+export function unchecked_increment(source) {
+	unchecked_set(source, source.v + 1);
 }

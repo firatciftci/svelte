@@ -121,6 +121,7 @@ const bundle = await bundle_code(
 );
 
 /**
+ * Asserts that the specified strings are absent from the bundle
  * @param {string} case_name
  * @param {string[]} strings
  */
@@ -155,6 +156,14 @@ check_bundle(
 	'push_renderer',
 	'renderer_cannot_cross',
 	'sync_shared_containers'
+);
+check_bundle(
+	'Async-only code',
+	'function async_expression',
+	'function increment_pending',
+	'rebases.add(',
+	'#decrement_queued = true',
+	'this.local_pending_count += d'
 );
 
 if (failed) {

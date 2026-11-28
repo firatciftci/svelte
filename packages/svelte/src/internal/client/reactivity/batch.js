@@ -31,6 +31,7 @@ import {
 	active_reaction,
 	get,
 	increment_write_version,
+	invalidate_derived_checks,
 	is_destroying_effect,
 	is_dirty,
 	is_outdated,
@@ -52,7 +53,7 @@ import {
 	source,
 	update
 } from './sources.js';
-import { eager_effect, teardown, unlink_effect } from './effects.js';
+import { eager_effect, eager_effects_used, teardown, unlink_effect } from './effects.js';
 import { UNINITIALIZED } from '../../../constants.js';
 import { set_signal_status, update_derived_status } from './status.js';
 import { invariant } from '../../shared/dev.js';
@@ -348,6 +349,8 @@ export class Batch {
 	}
 
 	#is_deferred() {
+		if (!async_mode_flag) return false;
+
 		if (this.is_fork) return true;
 
 		for (const effect of this.#pending.keys()) {
@@ -392,6 +395,8 @@ export class Batch {
 	 * @param {Effect | null} [root]
 	 */
 	is_blocked_by(effect, root = null) {
+		if (!async_mode_flag) return false;
+
 		for (var e = /** @type {Effect | null} */ (effect); e !== null && e !== root; e = e.parent) {
 			if (this.#skips(e)) return false;
 
@@ -750,6 +755,8 @@ export class Batch {
 	 * @param {Iterable<Source>} sources
 	 */
 	#revalidate(sources) {
+		if (!async_mode_flag) return;
+
 		// deriveds added during iteration are visited too, so this doubles as a worklist
 		/** @type {Set<Value>} */
 		var values = new Set(sources);
@@ -1029,6 +1036,9 @@ export class Batch {
 		// are only captured while no view is active, see `async_derived`)
 		batch_values?.set(source, entry);
 
+		// (a write of the real value doesn't allocate a version, but it can still change what the active view holds)
+		if (same) invalidate_derived_checks();
+
 		// an assignment replaces the value of a derived that the active view of the world holds
 		view_cache?.delete(/** @type {Derived} */ (source));
 
@@ -1048,7 +1058,7 @@ export class Batch {
 			this.mark(source, DIRTY, updated_during_traversal);
 			seen = null;
 
-			if (eager_effects.size > 0 && !eager_effects_deferred) {
+			if (eager_effects_used && eager_effects.size > 0 && !eager_effects_deferred) {
 				flush_eager_effects();
 			}
 		}
@@ -1107,6 +1117,8 @@ export class Batch {
 	}
 
 	#commit() {
+		if (!async_mode_flag) return;
+
 		// If there are other pending batches, they now need to be 'rebased' —
 		// in other words, their view of the world now includes the newly committed
 		// state (unless the batch in question has a more recent value for a given source),
@@ -1179,6 +1191,8 @@ export class Batch {
 	 * If it has pending work it stays linked, coming first from now on (see `#move_to_front`)
 	 */
 	commit_writes() {
+		if (!async_mode_flag) return;
+
 		this.#commit();
 		if (this.linked && this.prev !== null) this.#move_to_front();
 	}
@@ -1187,6 +1201,8 @@ export class Batch {
 	 * @param {Effect} effect
 	 */
 	increment(effect) {
+		if (!async_mode_flag) return;
+
 		var count = this.#pending.get(effect) ?? 0;
 		this.#pending.set(effect, count + 1);
 	}
@@ -1195,6 +1211,8 @@ export class Batch {
 	 * @param {Effect} effect
 	 */
 	decrement(effect) {
+		if (!async_mode_flag) return;
+
 		var count = this.#pending.get(effect) ?? 0;
 
 		if (count === 1) {
@@ -1385,7 +1403,7 @@ export class Batch {
 
 			var not_dirty = (flags & DIRTY) === 0;
 
-			if ((flags & EAGER_EFFECT) !== 0) {
+			if (eager_effects_used && (flags & EAGER_EFFECT) !== 0) {
 				if (!this.is_fork) {
 					// don't set a DIRTY reaction to MAYBE_DIRTY
 					if (not_dirty) {
@@ -1528,6 +1546,8 @@ export class Batch {
 	 * on: This ensures logic about who sees what values in intersects/merge/etc work correctly.
 	 */
 	#move_to_front() {
+		if (!async_mode_flag) return;
+
 		var prev = /** @type {Batch} */ (this.prev);
 		var first = /** @type {Batch} */ (first_batch);
 
@@ -1836,6 +1856,8 @@ function later_writer(batch, source) {
  * @param {BatchValue} entry
  */
 function apply(source, entry) {
+	// Fork commits apply existing versions, rather than allocating new ones.
+	invalidate_derived_checks();
 	source.v = entry.v;
 	source.wv = entry.wv;
 	source.f = entry.e ? source.f | ERROR_VALUE : source.f & ~ERROR_VALUE;
